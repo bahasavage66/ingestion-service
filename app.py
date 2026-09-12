@@ -8,13 +8,15 @@ No API keys required for the core path. URLs are never logged or stored.
 """
 
 import asyncio
+import concurrent.futures
+import json
 import os
 import re
 import shutil
 import tempfile
 import urllib.request
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yt_dlp
 from fastapi import FastAPI
@@ -31,6 +33,11 @@ TIKTOK_MS_TOKEN = os.environ.get("TIKTOK_MS_TOKEN")
 
 TRANSCRIPT_MAX_CHARS = 20000
 CAPTION_MAX_CHARS = 2000
+
+# Hard budget for one ingest request. TikTok/Instagram extraction can hang
+# when those sites block datacenter IPs; this turns a hang into a clear
+# message instead of a proxy timeout.
+INGEST_TIMEOUT_SEC = int(os.environ.get("INGEST_TIMEOUT_SEC", "240"))
 
 
 class IngestRequest(BaseModel):
@@ -137,8 +144,31 @@ def fetch_url_text(url: str) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+def clean_pb3_json(raw: str) -> Optional[str]:
+    """YouTube caption tracks sometimes arrive as JSON3 ("pb3") instead of
+    WebVTT. Extract the spoken segments as plain text."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("wireMagic") != "pb3":
+        return None
+    parts: List[str] = []
+    for ev in data.get("events") or []:
+        for seg in ev.get("segs") or []:
+            text = (seg.get("utf8") or "").replace("\n", " ").strip()
+            text = text.replace("\u266a", "").strip()
+            text = re.sub(r"\s{2,}", " ", text)
+            if text and (not parts or parts[-1] != text):
+                parts.append(text)
+    return " ".join(parts) if parts else ""
+
+
 def clean_subtitle_text(raw: str) -> str:
-    """Strip WebVTT/SRT markup down to plain spoken text."""
+    """Strip WebVTT/SRT/pb3-JSON caption markup down to plain spoken text."""
+    pb3 = clean_pb3_json(raw)
+    if pb3 is not None:
+        return pb3
     lines: List[str] = []
     for line in raw.splitlines():
         line = line.strip()
@@ -250,26 +280,34 @@ def transcript_from_whisper(url: str) -> str:
 
 # ---------------------------------------------------------------- endpoints
 
+def run_with_timeout(fn: Callable[[], Any], timeout: int) -> Any:
+    """Run blocking work with a hard time budget; raise TimeoutError on expiry.
+
+    Never blocks on the hung worker: the request returns promptly while the
+    abandoned thread finishes (or dies) on its own.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(f"timed out after {timeout}s") from None
+    finally:
+        # wait=False: a hung worker must not delay the HTTP response.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/ingest")
-def ingest(req: IngestRequest):
-    url = (req.url or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return JSONResponse(
-            status_code=422,
-            content={"error": "That doesn't look like a web link. Paste the full video URL starting with https://."},
-        )
-
-    platform = detect_platform(url)
-
+def _ingest_pipeline(url: str, platform: str) -> Dict[str, Any]:
+    """Blocking metadata + transcript pipeline. Runs under run_with_timeout."""
     try:
         info = extract_metadata(url)
     except ValueError as exc:
-        return JSONResponse(status_code=422, content={"error": friendly_error(exc, platform)})
+        raise _IngestFailed(friendly_error(exc, platform)) from exc
 
     title = info.get("title") or "Untitled video"
     creator = info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""
@@ -287,24 +325,20 @@ def ingest(req: IngestRequest):
             transcript = transcript_from_whisper(url)
             transcript_source = "whisper"
         except ValueError as exc:
-            return JSONResponse(
-                status_code=422,
-                content={"error": friendly_error(exc, platform) + " (no captions were available to read instead)"},
-            )
+            raise _IngestFailed(
+                friendly_error(exc, platform) + " (no captions were available to read instead)"
+            ) from exc
         except Exception:
-            return JSONResponse(
-                status_code=422,
-                content={"error": "The video was found, but no transcript could be produced from it."},
-            )
-
-    transcript = transcript[:TRANSCRIPT_MAX_CHARS]
+            raise _IngestFailed(
+                "The video was found, but no transcript could be produced from it."
+            ) from None
 
     return {
         "title": title,
         "creator": creator,
         "caption": caption,
         "thumbnail_url": thumbnail_url,
-        "transcript": transcript,
+        "transcript": transcript[:TRANSCRIPT_MAX_CHARS],
         "transcript_source": transcript_source,
         "duration_sec": duration,
         "view_count": view_count,
@@ -312,6 +346,44 @@ def ingest(req: IngestRequest):
         "published_at": published_at,
         "source_url": url,
     }
+
+
+class _IngestFailed(Exception):
+    """Expected failure with a user-facing message."""
+
+
+@app.post("/ingest")
+def ingest(req: IngestRequest):
+    url = (req.url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse(
+            status_code=422,
+            content={"error": "That doesn't look like a web link. Paste the full video URL starting with https://."},
+        )
+
+    platform = detect_platform(url)
+
+    try:
+        result = run_with_timeout(
+            lambda: _ingest_pipeline(url, platform), timeout=INGEST_TIMEOUT_SEC
+        )
+    except _IngestFailed as exc:
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    except TimeoutError:
+        if platform == "tiktok":
+            msg = (
+                "TikTok isn't answering our servers right now — it blocks automated "
+                "access from data centers. Try a YouTube link instead."
+            )
+        elif platform == "instagram":
+            msg = (
+                "Instagram isn't answering our servers right now. "
+                "Try a YouTube link instead."
+            )
+        else:
+            msg = "The video site took too long to respond. Try again in a moment."
+        return JSONResponse(status_code=422, content={"error": msg})
+    return result
 
 
 async def _fetch_trending(count: int) -> List[Dict[str, Any]]:
